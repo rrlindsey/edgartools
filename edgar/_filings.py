@@ -67,7 +67,7 @@ from edgar.reference.tickers import Exchange, find_ticker, find_ticker_safe
 from edgar.richtools import Docs, print_rich, repr_rich, rich_to_text
 from edgar.search import BM25Search, RegexSearch
 from edgar.sgml import FilingHeader, FilingSGML, Reports, Statements
-from edgar.storage import is_using_local_storage, local_filing_path
+from edgar.storage import is_using_local_storage, local_filing_path, resolve_local_filing_path
 from edgar.xbrl import XBRL, XBRLFilingWithNoXbrlData
 
 """ Contain functionality for working with SEC filing indexes and filings
@@ -1654,6 +1654,16 @@ class Filing:
     @lru_cache(maxsize=4)
     def text(self) -> str:
         """Convert the html of the main filing document to text"""
+        # Offline shortcut for historic pre-HTML filings: when the primary document has no
+        # <FILENAME> (so html()/_download_filing_text would otherwise re-fetch it over the
+        # network) and it is plain text, return that document's text straight from the
+        # locally-parsed SGML. This yields the same <TEXT> body the network path returns.
+        # Tightly scoped — <FILENAME>-less, non-binary, non-XML, non-HTML, no TEXT-EXTRACT
+        # sibling — so every other shape (HTML, XML, PDF UPLOAD, TEXT-EXTRACT) is unaffected.
+        local_text = self._local_primary_text()
+        if local_text is not None:
+            return local_text
+
         html_content = self.html()
         if html_content and is_probably_html(html_content):
             parser = HTMLParser(ParserConfig(form=self.form))
@@ -1672,6 +1682,40 @@ class Filing:
             else:
                 return self._download_filing_text()
 
+    def _local_primary_text(self) -> Optional[str]:
+        """Return the primary document's plain text from the locally-parsed SGML, or None.
+
+        Only returns a value for the historic pre-HTML case — a <FILENAME>-less primary
+        document that is plain text (not binary/XML/HTML) and has no TEXT-EXTRACT sibling.
+        For every other filing this returns None so text() falls through to its normal path,
+        preserving existing behavior (HTML rendering, XML→"", PDF UPLOAD via TEXT-EXTRACT).
+        """
+        try:
+            sgml = self.sgml()
+        except Exception:
+            return None
+        if sgml is None:
+            return None
+        if len(self.attachments.query("document_type == 'TEXT-EXTRACT'")) > 0:
+            return None
+        primary = sgml.attachments.primary_documents
+        if not primary:
+            return None
+        doc = primary[0]
+        # Require a <FILENAME>-less primary (the historic pre-HTML shape). Filings with a
+        # named primary keep their existing text() path, including homepage HTML rendering.
+        if not doc.empty or doc.is_binary() or doc.is_xml():
+            return None
+        content = doc.content
+        if isinstance(content, bytes):
+            content = content.decode('utf-8', 'replace')
+        if not content or not content.strip():
+            return None
+        stripped = content.lstrip()
+        if is_probably_html(content) or stripped.startswith('<?xml'):
+            return None
+        return content
+
     def _download_filing_text(self):
         """
         Download the text of the filing directly from the primary text sources.
@@ -1688,8 +1732,8 @@ class Filing:
     def full_text_submission(self) -> str:
         """Return the complete text submission file"""
         if is_using_local_storage():
-            local_path = self._local_path()
-            if local_path.exists():
+            local_path = resolve_local_filing_path(str(self.filing_date), self.accession_no)
+            if local_path is not None:
                 from edgar.sgml.sgml_common import read_content_as_string
                 return read_content_as_string(local_path)
         downloaded = download_file(self.text_url, as_text=True)
@@ -1881,8 +1925,8 @@ class Filing:
         if self._sgml:
             return self._sgml
         if is_using_local_storage():
-            local_path = local_filing_path(str(self.filing_date), self.accession_no)
-            if local_path.exists():
+            local_path = resolve_local_filing_path(str(self.filing_date), self.accession_no)
+            if local_path is not None:
                 self._sgml = FilingSGML.from_source(local_path)
 
         if self._sgml is None:
@@ -1892,9 +1936,13 @@ class Filing:
 
         if self._sgml is None:
             if is_using_local_storage():
-                log.warning(
+                # Network fallback is a supported mode (allow_network_fallback=True), so a
+                # genuine local miss is routine, not anomalous — keep this at debug to avoid
+                # per-filing noise in bulk loops. When fallback is disabled the code below
+                # raises, surfacing the problem directly.
+                log.debug(
                     f"Filing bundle {self.accession_no} not found in local storage "
-                    f"(was the {self.filing_date} feed file downloaded?). "
+                    f"(searched the {self.filing_date} feed folder and adjacent days). "
                     f"Falling back to full network fetch. To avoid this, run "
                     f"download_filings(filing_date='{self.filing_date}')."
                 )
@@ -2034,8 +2082,14 @@ class Filing:
     @lru_cache(maxsize=1)
     def sections(self) -> List[str]:
         html = self.html()
-        assert html is not None
-        return html_sections(html)
+        if html is not None:
+            return html_sections(html)
+        # Old text-only filings (pre-2002) — chunk on <PAGE> markers.
+        text = self.text()
+        if not text:
+            return []
+        chunks = [c.strip() for c in re.split(r"<PAGE>|\n\s*\n", text) if len(c.strip()) >= 50]
+        return chunks if chunks else [text]
 
     @cached_property
     def __get_bm25_search_index(self):
@@ -2048,7 +2102,14 @@ class Filing:
     def search(self,
                query: str,
                regex=False):
-        """Search for the query string in the filing HTML"""
+        """Search for the query string in the filing HTML.
+
+        Returns a ``SearchResults`` whose rendered output highlights the matched
+        query terms in bold red. With ``regex=False`` (default, BM25 relevance
+        search) each query word is highlighted as a case-insensitive substring,
+        so "repurchase" also lights up "repurchases". With ``regex=True`` the
+        matches of the regex pattern itself are highlighted.
+        """
         if regex:
             return self.__get_regex_search_index.search(query)
         return self.__get_bm25_search_index.search(query)
@@ -2078,29 +2139,19 @@ class Filing:
         from edgar.search.grep import GrepResult, _grep_text
 
         all_matches = []
+        found_any_text = False
 
         try:
             attachments = self.attachments
         except Exception:
-            return GrepResult(pattern, [])
+            attachments = []
 
         for attachment in attachments:
-            # Filter by document if specified
-            if document:
-                if document.lower() == "primary":
-                    if attachment.sequence_number != "1":
-                        continue
-                else:
-                    # Match by document_type (e.g. "EX-10.1") or document filename
-                    doc_type = (attachment.document_type or "").upper()
-                    if document.upper() not in doc_type and document.lower() not in (attachment.document or "").lower():
-                        continue
-
-            # Skip binary/non-text attachments
+            if document and not self._attachment_matches(attachment, document):
+                continue
             if attachment.empty or attachment.is_binary():
                 continue
 
-            # Get text content
             try:
                 text = attachment.text()
             except Exception as e:
@@ -2110,19 +2161,48 @@ class Filing:
             if not text:
                 continue
 
-            # Determine location label
-            doc_type = attachment.document_type or ""
-            if attachment.sequence_number == "1":
-                location = "primary"
-            elif doc_type:
-                location = doc_type
-            else:
-                location = attachment.document or f"doc-{attachment.sequence_number}"
+            found_any_text = True
+            location = self._attachment_location(attachment)
+            all_matches.extend(_grep_text(text, pattern, location, regex=regex))
 
-            matches = _grep_text(text, pattern, location, regex=regex)
-            all_matches.extend(matches)
+        # Old text filings: SGML returns empty attachment shells, fall back to filing.text().
+        if not found_any_text and (document is None or document.lower() == "primary"):
+            all_matches.extend(self._grep_filing_text(pattern, regex))
 
         return GrepResult(pattern, all_matches)
+
+    @staticmethod
+    def _attachment_matches(attachment, document: str) -> bool:
+        """Whether `attachment` satisfies grep()'s `document` filter."""
+        if document.lower() == "primary":
+            return attachment.sequence_number == "1"
+        doc_type = (attachment.document_type or "").upper()
+        if document.upper() in doc_type:
+            return True
+        return document.lower() in (attachment.document or "").lower()
+
+    @staticmethod
+    def _attachment_location(attachment) -> str:
+        """Label for an attachment in grep result locations."""
+        if attachment.sequence_number == "1":
+            return "primary"
+        if attachment.document_type:
+            return attachment.document_type
+        return attachment.document or f"doc-{attachment.sequence_number}"
+
+    def _grep_filing_text(self, pattern: str, regex: bool) -> list:
+        """Grep the combined filing text as a 'primary' document.
+
+        Used by grep() when no attachment yields usable text — covers older
+        plain-text filings whose SGML decomposition emits empty shells.
+        """
+        from edgar.search.grep import _grep_text
+        try:
+            text = self.text()
+        except Exception as e:
+            log.debug(f"grep: could not extract filing text: {e}")
+            return []
+        return _grep_text(text, pattern, "primary", regex=regex) if text else []
 
     @property
     def filing_url(self) -> str:
@@ -2301,7 +2381,8 @@ class Filing:
                 Returns: FormC (crowdfunding offering details)
               - Use .docs for detailed API documentation
               - Use .xbrl() for financial statements (if available)
-              - Use .document() for structured text extraction
+              - Use .text() or .markdown() for full document text
+              - Use .document for the primary document (Attachment)
               - Use .attachments for exhibits (5 documents)
         """
         from edgar import get_obj_info
@@ -2359,7 +2440,8 @@ class Filing:
                                                                                 '6-K'] else "(if available)"
             lines.append(f"  - Use .xbrl() {xbrl_hint}")
 
-            lines.append("  - Use .document() for structured text extraction")
+            lines.append("  - Use .text() or .markdown() for full document text")
+            lines.append("  - Use .document for the primary document (Attachment)")
 
             # Add attachments info if available
             try:
